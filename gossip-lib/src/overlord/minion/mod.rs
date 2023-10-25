@@ -50,6 +50,7 @@ pub struct Minion {
     postings: HashSet<Id>,
     sought_events: HashMap<Id, EventSeekState>,
     last_message_sent: String,
+    general_feed_start: Option<Unixtime>,
 }
 
 impl Minion {
@@ -78,6 +79,7 @@ impl Minion {
             postings: HashSet::new(),
             sought_events: HashMap::new(),
             last_message_sent: String::new(),
+            general_feed_start: None,
         })
     }
 }
@@ -413,6 +415,10 @@ impl Minion {
             ToMinionPayloadDetail::SubscribeDmChannel(dmchannel) => {
                 self.subscribe_dm_channel(message.job_id, dmchannel).await?;
             }
+            ToMinionPayloadDetail::TempSubscribeGeneralFeedChunk(pubkeys) => {
+                self.temp_subscribe_general_feed_chunk(message.job_id, pubkeys)
+                    .await?;
+            }
             ToMinionPayloadDetail::TempSubscribeMetadata(pubkeys) => {
                 self.temp_subscribe_metadata(message.job_id, pubkeys)
                     .await?;
@@ -460,37 +466,39 @@ impl Minion {
     async fn subscribe_general_feed(
         &mut self,
         job_id: u64,
-        followed_pubkeys: Vec<PublicKey>,
+        pubkeys: Vec<PublicKey>,
     ) -> Result<(), Error> {
         let mut filters: Vec<Filter> = Vec::new();
 
-        tracing::debug!(
-            "Following {} people at {}",
-            followed_pubkeys.len(),
-            &self.url
-        );
+        tracing::debug!("Following {} people at {}", pubkeys.len(), &self.url);
 
         // Compute how far to look back
-        let feed_since = {
-            if self.subscription_map.has("general_feed") {
-                // don't lookback if we are just adding more people
+        let since = {
+            if let Some(_) = self.general_feed_start {
+                // We already have a general subscription.
+                // Therefore, don't lookback at all. We are just adding more people
+                //    and we don't want to reload everybody's events again.
+                // FIXME: we should do a separate temp subscription for the more people added
+                // to get their events over the past chunk.
                 Unixtime::now().unwrap()
             } else {
-                self.compute_since(GLOBALS.storage.read_setting_feed_chunk())
+                let since = self.compute_since(GLOBALS.storage.read_setting_feed_chunk());
+                self.general_feed_start = Some(since);
+                since
             }
         };
 
         // Allow all feed related event kinds (including DMs)
         let event_kinds = crate::feed::feed_related_event_kinds(true);
 
-        if !followed_pubkeys.is_empty() {
-            let pkp: Vec<PublicKeyHex> = followed_pubkeys.iter().map(|pk| pk.into()).collect();
+        if !pubkeys.is_empty() {
+            let pkp: Vec<PublicKeyHex> = pubkeys.iter().map(|pk| pk.into()).collect();
 
             // feed related by people followed
             filters.push(Filter {
                 authors: pkp,
                 kinds: event_kinds.clone(),
-                since: Some(feed_since),
+                since: Some(since),
                 ..Default::default()
             });
 
@@ -502,7 +510,7 @@ impl Minion {
             // in the last 8 hours (so we don't do it every client restart).
             let keys_needing_relay_lists: Vec<PublicKeyHex> = GLOBALS
                 .people
-                .get_subscribed_pubkeys_needing_relay_lists(&followed_pubkeys)
+                .get_subscribed_pubkeys_needing_relay_lists(&pubkeys)
                 .drain(..)
                 .map(|pk| pk.into())
                 .collect();
@@ -841,6 +849,60 @@ impl Minion {
         filter.d = vec![ea.d];
 
         self.subscribe(vec![filter], &handle, job_id).await
+    }
+
+    // Load more, one more chunk back
+    async fn temp_subscribe_general_feed_chunk(
+        &mut self,
+        job_id: u64,
+        pubkeys: Vec<PublicKey>,
+    ) -> Result<(), Error> {
+        let mut filters: Vec<Filter> = Vec::new();
+
+        let end = {
+            if let Some(end) = self.general_feed_start {
+                end
+            } else {
+                // This shouldn't happen, but if it does
+                Unixtime::now().unwrap()
+            }
+        };
+
+        let chunk_secs = GLOBALS.storage.read_setting_feed_chunk();
+        let start = Unixtime(end.0 - chunk_secs as i64);
+        self.general_feed_start = Some(start);
+
+        tracing::debug!(
+            "Following {} people at {}, from {} to {}",
+            pubkeys.len(),
+            &self.url,
+            start,
+            end
+        );
+
+        // Allow all feed related event kinds (including DMs)
+        let event_kinds = crate::feed::feed_related_event_kinds(true);
+
+        if pubkeys.is_empty() {
+            // Nothing to do
+            return Ok(());
+        }
+
+        let pkp: Vec<PublicKeyHex> = pubkeys.iter().map(|pk| pk.into()).collect();
+
+        // feed related by people followed
+        filters.push(Filter {
+            authors: pkp,
+            kinds: event_kinds.clone(),
+            since: Some(start),
+            until: Some(end),
+            ..Default::default()
+        });
+
+        let sub_name = format!("temp_general_feed_chunk_{}", job_id);
+        self.subscribe(filters, &*sub_name, job_id).await?;
+
+        Ok(())
     }
 
     async fn temp_subscribe_metadata(
